@@ -3,6 +3,7 @@ import * as tls from 'tls';
 import * as crypto from 'crypto';
 import * as https from 'https';
 import * as http from 'http';
+import * as dns from 'dns';
 import WebSocket from 'ws';
 
 interface LatencyStats {
@@ -14,17 +15,82 @@ interface LatencyStats {
 
 interface ProxyDetectionResult {
   domain: string;
-  tlsFingerprints: string[];
-  handshakeTimes: number[];
-  latencyStats: LatencyStats;
-  headerEntropy: number;
-  responseHashConsistency: boolean;
-  websocketUpgrade: boolean;
-  anomalyScore: number;
-  proxyLikely: boolean;
+  blocked: boolean;
+  ip?: string;
+}
+
+interface BlockedIP {
+  ip: string;
+  domain: string;
+  timestamp: number;
 }
 
 class ProxyDetector {
+  private blockedIPs: Set<string> = new Set();
+  private blockedIPsData: BlockedIP[] = [];
+  private blocklistDomains: Set<string> = new Set();
+
+  async initializeBlocklist(): Promise<void> {
+    try {
+      const response = await new Promise<string>((resolve, reject) => {
+        https.get('https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts', (res) => {
+          let data = '';
+          res.on('data', (chunk) => data += chunk);
+          res.on('end', () => resolve(data));
+        }).on('error', reject);
+      });
+      
+      const lines = response.split('\n');
+      for (const line of lines) {
+        if (line.startsWith('0.0.0.0') || line.startsWith('127.0.0.1')) {
+          const parts = line.split(/\s+/);
+          if (parts.length >= 2) {
+            const domain = parts[1];
+            if (domain && !domain.startsWith('#') && domain.includes('.')) {
+              const cleanDomain = domain.replace(/^#|\s*#.*$/, '').trim();
+              if (cleanDomain && cleanDomain.includes('.')) {
+                this.blocklistDomains.add(cleanDomain.toLowerCase());
+              }
+            }
+          }
+        }
+      }
+      console.log(`Loaded ${this.blocklistDomains.size} domains from blocklist`);
+    } catch (error) {
+      console.log('Failed to load blocklist, using behavioral detection only');
+    }
+  }
+
+  async getDomainIP(domain: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      dns.lookup(domain, (err, address) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve(address);
+        }
+      });
+    });
+  }
+
+  isIPBlocked(ip: string): boolean {
+    return this.blockedIPs.has(ip);
+  }
+
+  blockIP(ip: string, domain: string): void {
+    if (!this.blockedIPs.has(ip)) {
+      this.blockedIPs.add(ip);
+      this.blockedIPsData.push({
+        ip,
+        domain,
+        timestamp: Date.now()
+      });
+    }
+  }
+
+  getBlockedIPs(): BlockedIP[] {
+    return this.blockedIPsData;
+  }
   async getTLSFingerprint(domain: string): Promise<string> {
     return new Promise((resolve, reject) => {
       const socket = tls.connect(443, domain, { servername: domain });
@@ -128,20 +194,44 @@ class ProxyDetector {
     }
   }
 
-  async checkWispServers(domain: string): Promise<boolean> {
+  async checkWispServerConnection(domain: string): Promise<boolean> {
     try {
       const response = await this.makeHTTPSRequest(domain);
       const body = response.body.toLowerCase();
       
-      const wispIndicators = [
+      const explicitProxyPatterns = [
+        'tunnel websocket',
+        'proxy websocket', 
         'websocket tunnel',
-        'multiplexed connection',
-        'proxy tunnel',
         'socket proxy',
+        'wisp server',
+        'multiplexed websocket',
+        'websocket multiplexing',
+        'proxy tunnel',
         'tunnel server'
       ];
       
-      return wispIndicators.some(indicator => body.includes(indicator));
+      const hasExplicitProxy = explicitProxyPatterns.some(pattern => body.includes(pattern));
+      
+      if (hasExplicitProxy) {
+        const wsUrls = body.match(/wss?:\/\/[^\s"']+/g);
+        if (wsUrls && wsUrls.length > 0) {
+          let externalWispConnections = 0;
+          for (const wsUrl of wsUrls) {
+            try {
+              const wsDomain = wsUrl.replace(/^(wss?:\/\/)/, '').split('/')[0].split(':')[0];
+              if (wsDomain !== domain && await this.testWebSocketUpgrade(wsDomain)) {
+                externalWispConnections++;
+              }
+            } catch (error) {
+              continue;
+            }
+          }
+          return externalWispConnections >= 2;
+        }
+      }
+      
+      return false;
     } catch (error) {
       return false;
     }
@@ -199,6 +289,24 @@ class ProxyDetector {
   }
 
   async analyzeDomain(domain: string): Promise<ProxyDetectionResult> {
+    const domainLower = domain.toLowerCase();
+    
+    if (this.blocklistDomains.has(domainLower)) {
+      try {
+        const ip = await this.getDomainIP(domain);
+        this.blockIP(ip, domain);
+        return {
+          domain,
+          blocked: true,
+          ip
+        };
+      } catch (error) {
+        return {
+          domain,
+          blocked: true
+        };
+      }
+    }
     const numRequests = 5;
     const tlsFingerprints: string[] = [];
     const handshakeTimes: number[] = [];
@@ -241,7 +349,7 @@ class ProxyDetector {
     const handshakeVariance = this.calculateVariance(handshakeTimes);
     const websocketUpgrade = await this.testWebSocketUpgrade(domain);
     const isBareMux = await this.checkBareMux(domain);
-    const isWispServer = await this.checkWispServers(domain);
+    const hasWispConnection = await this.checkWispServerConnection(domain);
     
     let anomalyScore = 0;
     
@@ -250,41 +358,48 @@ class ProxyDetector {
     }
     
     if (handshakeVariance > 100) {
-      anomalyScore += Math.min(handshakeVariance / 100, 1) * 0.4;
+      anomalyScore += Math.min(handshakeVariance / 100, 1) * 0.3;
     }
     
-    if (latencyStats.variance > 800) {
-      anomalyScore += Math.min(latencyStats.variance / 800, 1) * 0.3;
+    if (latencyStats.variance > 1000) {
+      anomalyScore += Math.min(latencyStats.variance / 1000, 1) * 0.2;
     }
     
-    if (uniqueResponseHashes > 2) {
-      anomalyScore += (uniqueResponseHashes - 2) * 0.2;
+    if (uniqueResponseHashes > 3) {
+      anomalyScore += (uniqueResponseHashes - 3) * 0.15;
     }
     
     if (!websocketUpgrade) {
-      anomalyScore += 0.2;
+      anomalyScore += 0.1;
     }
     
     if (isBareMux) {
+      anomalyScore += 0.5;
+    }
+    
+    if (hasWispConnection) {
       anomalyScore += 0.6;
     }
     
-    if (isWispServer) {
-      anomalyScore += 0.8;
-    }
+    const proxyLikely = anomalyScore > 0.9;
     
-    const proxyLikely = anomalyScore > 0.5;
+    let ip: string | undefined;
+    if (proxyLikely) {
+      try {
+        ip = await this.getDomainIP(domain);
+        this.blockIP(ip, domain);
+      } catch (error) {
+        return {
+          domain,
+          blocked: false
+        };
+      }
+    }
     
     return {
       domain,
-      tlsFingerprints,
-      handshakeTimes,
-      latencyStats,
-      headerEntropy: avgHeaderEntropy,
-      responseHashConsistency: uniqueResponseHashes === 1,
-      websocketUpgrade,
-      anomalyScore,
-      proxyLikely
+      blocked: proxyLikely,
+      ip
     };
   }
 }
@@ -312,8 +427,27 @@ app.get('/v1/dusk/check/url=:domain', async (req: Request, res: Response) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+app.get('/v1/dusk/blocked-ips', (req: Request, res: Response) => {
+  try {
+    const blockedIPs = detector.getBlockedIPs();
+    res.json(blockedIPs);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to get blocked IPs' });
+  }
 });
+
+async function startServer() {
+  try {
+    await detector.initializeBlocklist();
+  } catch (error) {
+    console.log('Failed to initialize blocklist, using behavioral detection only');
+  }
+  
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
+
+startServer();
 
 export default app;
